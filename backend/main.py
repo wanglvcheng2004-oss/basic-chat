@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .agent import AgentConfig, AgentRuntime
 from .agent.automation import Automation
+from .agent.continuity import ContinuityStore, ContinuityService, ContinuityError
+from .agent.github_gateway import GitHubGateway, GitHubError
 from .agent.store import AgentStore
 from .agent.types import ROOM_THREAD, now_iso
 from .connection_manager import ConnectionManager
@@ -32,8 +34,14 @@ class Login(BaseModel):
     invite: str = Field(default='', max_length=100)
 
 
+class GitHubBind(BaseModel):
+    repo: str = Field(min_length=3, max_length=200)
+    pr: int = Field(gt=0)
+
+
 class PolicyUpdate(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
+    autoReply: bool | None = None
     preprocess: bool | None = None
     watchdog: bool | None = None
     summary: bool | None = None
@@ -63,7 +71,7 @@ def same_origin(request):
     return parsed.scheme in {'http', 'https'} and parsed.netloc == host.netloc
 
 
-def create_app(config=None, *, llm=None):
+def create_app(config=None, *, llm=None, github=None):
     config = config or AgentConfig.from_env()
     db = Database(config.state_path / 'chat.sqlite3')
     manager = ConnectionManager()
@@ -71,6 +79,26 @@ def create_app(config=None, *, llm=None):
     runtime = AgentRuntime(config, manager, store=AgentStore(db=db), llm=llm)
     automation = Automation(runtime, db)
     runtime.automation = automation
+    continuity_store = ContinuityStore(db)
+    runtime.continuity_store = continuity_store
+    if github is None and config.github_projects and config.github_token:
+        try:
+            github = GitHubGateway(json.loads(config.github_projects), config.github_token)
+        except (ValueError, GitHubError) as exc:
+            raise RuntimeError('GitHub 项目配置无效，请检查允许仓库与设计维护者列表。') from exc
+    runtime.github_gateway = github
+    continuity = ContinuityService(continuity_store, github, runtime.on_github_feedback, notify=runtime.on_github_status) if github is not None else None
+
+    async def poll_continuity():
+        while True:
+            await asyncio.sleep(30)
+            links = await db.all('SELECT task_id,owner_id FROM continuity_links')
+            for link in links:
+                try:
+                    await continuity.sync(link['task_id'], link['owner_id'])
+                except Exception:
+                    # Keep the event pending; the next poll can retry without leaking credentials.
+                    continue
 
     @asynccontextmanager
     async def lifespan(_):
@@ -81,12 +109,19 @@ def create_app(config=None, *, llm=None):
             if not claimed:
                 raise RuntimeError('此数据目录已有运行实例；请关闭另一实例，或使用独立 CHAT_DATA_DIR。异常退出后最多等待 30 秒。')
             await identity.initialize()
+            await continuity_store.initialize()
             await automation.initialize()
             await runtime.start()
+            poller = asyncio.create_task(poll_continuity()) if continuity else None
             yield
         finally:
             if claimed:
+                if 'poller' in locals() and poller is not None:
+                    poller.cancel()
+                    await asyncio.gather(poller, return_exceptions=True)
                 await runtime.stop()
+                if github is not None:
+                    await github.close()
                 await db.release('runtime', runtime.instance_id)
             await db.close()
 
@@ -161,6 +196,60 @@ def create_app(config=None, *, llm=None):
             raise HTTPException(409, '请先启用定时摘要。')
         await automation.schedule_summary(manual=True)
         return await automation.snapshot()
+
+    @app.get('/api/github/repositories')
+    async def github_repositories(request: Request):
+        await member(request)
+        return {'repositories': github.repositories if github else []}
+
+    @app.post('/api/tasks/{task_id}/github')
+    async def bind_github(task_id: str, payload: GitHubBind, request: Request):
+        found = await member(request)
+        task = runtime.store.get_task(task_id)
+        if task is None or task.owner_id != found.id or task.channel != 'room':
+            raise HTTPException(404, '未找到自己的公开任务。')
+        if github is None:
+            raise HTTPException(503, 'GitHub 仓库或凭据未配置。')
+        try:
+            pr = await github.pull_request(payload.repo, payload.pr)
+            if pr['state'] != 'open' or pr['head_repo'] != payload.repo.lower():
+                raise ContinuityError('PR 必须开放且分支位于已配置仓库。')
+            existing = await github.feedback(payload.repo, payload.pr)
+            authorized_history = []
+            for event in existing:
+                if event.get('is_bot') or '<!-- continuity-event:' in event.get('body', '') or not await github.authorized(payload.repo, event.get('author', ''), event.get('association', 'NONE')):
+                    continue
+                authorized_history.append(event)
+            async with continuity._lock:
+                await continuity_store.bind_with_history(task.id, found.id, payload.repo, payload.pr,
+                    pr['branch'], pr['head_sha'], authorized_history)
+            return await continuity_store.get(task.id, found.id)
+        except (GitHubError, ContinuityError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get('/api/tasks/{task_id}/github')
+    async def github_status(task_id: str, request: Request):
+        found = await member(request)
+        link = await continuity_store.get(task_id, found.id)
+        if link is None:
+            raise HTTPException(404, '未找到关联的 PR。')
+        return {'link': link, 'status': await db.one('SELECT * FROM continuity_status WHERE task_id=?', (task_id,)),
+                'events': await continuity_store.history(task_id, found.id),
+                'comments': await db.all('SELECT id,state FROM continuity_outbox WHERE task_id=?', (task_id,))}
+
+    @app.post('/api/tasks/{task_id}/github/sync')
+    async def github_sync(task_id: str, request: Request):
+        found = await member(request)
+        if continuity is None:
+            raise HTTPException(503, 'GitHub 仓库或凭据未配置。')
+        try:
+            return {'events': await continuity.sync(task_id, found.id)}
+        except ContinuityError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except GitHubError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.websocket('/ws')
     async def websocket_chat(websocket: WebSocket):

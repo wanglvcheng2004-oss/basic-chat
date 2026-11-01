@@ -100,12 +100,13 @@ def tool_schemas(allow_write: bool = True) -> list[dict]:
     return schemas
 
 
-def _safe_path(raw: str) -> Path:
+def _safe_path(raw: str, root: Path | None = None) -> Path:
+    root = Path(root or ROOT).resolve()
     value = (raw or ".").strip().replace("\\", "/")
     candidate = Path(value)
-    resolved = candidate.resolve() if candidate.is_absolute() else (ROOT / candidate).resolve()
+    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
     try:
-        relative = resolved.relative_to(ROOT)
+        relative = resolved.relative_to(root)
     except ValueError as exc:
         raise ToolError("只能访问项目工作区内的文件") from exc
     if any(part.casefold() in BLOCKED_PARTS for part in relative.parts):
@@ -123,7 +124,9 @@ async def execute_tool(
     store: AgentStore,
     task: Task,
     allow_write: bool = True,
+    workspace_root: Path | None = None,
 ) -> str:
+    root = Path(workspace_root or ROOT).resolve()
     try:
         if name == "read_thread":
             thread_id = str(args.get("thread_id") or task.thread_id)
@@ -163,7 +166,7 @@ async def execute_tool(
             return _json({"tasks": [item.public() for item in tasks]})
 
         if name == "read_file":
-            path = _safe_path(str(args.get("path") or ""))
+            path = _safe_path(str(args.get("path") or ""), root)
             if not path.is_file():
                 raise ToolError("文件不存在或不是普通文件")
             limit = max(200, min(int(args.get("max_chars") or 4000), MAX_READ_CHARS))
@@ -171,7 +174,7 @@ async def execute_tool(
                 text = file.read(limit + 1)
             return _json(
                 {
-                    "path": str(path.relative_to(ROOT)).replace("\\", "/"),
+                    "path": str(path.relative_to(root)).replace("\\", "/"),
                     "content": text[:limit],
                     "truncated": len(text) > limit,
                     "totalChars": len(text),
@@ -179,48 +182,48 @@ async def execute_tool(
             )
 
         if name == "write_file":
-            if not allow_write or getattr(task, 'kind', 'interactive') != 'interactive':
+            if not allow_write or getattr(task, 'kind', 'interactive') not in {'interactive', 'continuity_edit'} or (getattr(task, 'kind', 'interactive') == 'continuity_edit' and workspace_root is None):
                 raise ToolError("当前未开启写入权限")
             content = str(args.get("content") or "")
             if len(content) > MAX_WRITE_CHARS:
                 raise ToolError(f"内容过长，最多 {MAX_WRITE_CHARS} 字符")
-            path = _safe_path(str(args.get("path") or ""))
+            path = _safe_path(str(args.get("path") or ""), root)
             if path.is_dir():
                 raise ToolError("目标是目录")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
             return _json(
                 {
-                    "path": str(path.relative_to(ROOT)).replace("\\", "/"),
+                    "path": str(path.relative_to(root)).replace("\\", "/"),
                     "bytes": len(content.encode("utf-8")),
                     "ok": True,
                 }
             )
 
         if name == "list_files":
-            root = _safe_path(str(args.get("path") or "."))
-            if not root.exists():
+            directory = _safe_path(str(args.get("path") or "."), root)
+            if not directory.exists():
                 raise ToolError("目录不存在")
             depth = max(1, min(int(args.get("depth") or 2), 3))
             entries: list[str] = []
-            for item in sorted(root.rglob("*")):
+            for item in sorted(directory.rglob("*")):
                 try:
-                    relative = item.relative_to(ROOT)
+                    relative = item.relative_to(root)
                 except ValueError:
                     continue
-                if len(relative.parts) > depth + len(root.relative_to(ROOT).parts):
+                if len(relative.parts) > depth + len(directory.relative_to(root).parts):
                     continue
                 if any(part in BLOCKED_PARTS for part in relative.parts):
                     continue
                 try:
-                    _safe_path(str(relative))
+                    _safe_path(str(relative), root)
                 except ToolError:
                     continue
                 suffix = "/" if item.is_dir() else ""
                 entries.append(str(relative).replace("\\", "/") + suffix)
                 if len(entries) >= 200:
                     break
-            return _json({"path": str(root.relative_to(ROOT)).replace("\\", "/") or ".", "entries": entries})
+            return _json({"path": str(directory.relative_to(root)).replace("\\", "/") or ".", "entries": entries})
 
         raise ToolError(f"未知工具：{name}")
     except ToolError as exc:

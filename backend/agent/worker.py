@@ -19,6 +19,7 @@ class Worker:
         runtime,
         task: Task,
         trigger: Trigger,
+        workspace_root=None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -26,12 +27,15 @@ class Worker:
         self.runtime = runtime
         self.task = task
         self.trigger = trigger
+        self.workspace_root = workspace_root
         self.message_id = f"msg_{task.id}_out"
         self.inbox: list[Trigger] = []
         self.finished = False
         self.accepting = True
         self.model = config.worker_model_heavy if task.complexity == "heavy" else config.worker_model
-        self._schemas = tool_schemas(config.allow_write)
+        self._allow_write = ((config.allow_write and task.kind not in {'auto_assist', 'continuity_edit'}) or
+                             (task.kind == 'continuity_edit' and config.github_write_enabled and workspace_root is not None))
+        self._schemas = tool_schemas(self._allow_write)
 
     def deliver(self, trigger: Trigger) -> bool:
         if self.finished or not self.accepting:
@@ -51,7 +55,7 @@ class Worker:
 
     async def run(self) -> None:
         try:
-            if self.runtime.harness_allowed():
+            if self.task.kind not in {'auto_assist', 'continuity_edit'} and self.runtime.harness_allowed():
                 await self._run_dsh()
             else:
                 await self._run_llm()
@@ -109,7 +113,8 @@ class Worker:
                         args,
                         store=self.store,
                         task=self.task,
-                        allow_write=self.config.allow_write,
+                        allow_write=self._allow_write,
+                        workspace_root=self.workspace_root,
                     )
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
                     self.store.update_task(self.task, updated_at=now_iso())

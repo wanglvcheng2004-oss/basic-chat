@@ -10,11 +10,14 @@ const {
   connect, send, sendAgent, stopTask, disconnect,
   followup, invite, isLocal, isAdmin, notices, dismissNotice,
   automation, automationError, automationBusy, setPolicy, summarizeNow, refreshAutomation,
+  githubRepositories, githubLinks, githubErrors, loadGitHubRepositories, loadGitHub, bindGitHub, syncGitHub,
 } = useChat()
 
 const panel = ref('private')
 const showInvite = ref(false)
 const supplements = reactive({})
+const githubPr = reactive({})
+const githubRepo = reactive({})
 const newResults = computed(() => automation.prepared.length + notices.value.length)
 function submitFollowup(task) {
   if (followup(task.taskId, supplements[task.taskId] || '')) supplements[task.taskId] = ''
@@ -112,6 +115,7 @@ function taskStatusLabel(value) {
           <div v-if="!messages.length && !roomStreams.length" class="empty-state"><span>✦</span><p>还没有消息，先打个招呼吧。</p></div>
           <article v-for="message in messages" :key="message.id" :class="['message', { mine: message.userId === userId, agent: message.isAgent }]">
             <div class="message-meta"><button v-if="message.userId !== userId && !message.isAgent" type="button" class="mention-name" :disabled="status !== 'connected'" :aria-label="`提及 ${message.nickname}`" :title="`@${message.nickname}`" @click="mentionPerson(message.nickname)">{{ message.nickname }}</button><strong v-else>{{ message.nickname }}</strong><time>{{ timeLabel(message.timestamp) }}</time></div>
+            <p v-if="message.replyToName" class="reply-target">回复 @{{ message.replyToName }}</p>
             <p>{{ message.content }}</p>
           </article>
           <article v-for="stream in roomStreams" :key="stream.id" class="message agent streaming">
@@ -165,12 +169,26 @@ function taskStatusLabel(value) {
             <details v-if="task.output || task.result" class="result-detail">
               <summary>查看结果</summary><p>{{ task.result || task.output }}</p>
             </details>
-            <details v-if="task.ownerId === userId && (!task.kind || task.kind === 'interactive')" class="result-detail">
+            <details v-if="task.ownerId === userId && (!task.kind || task.kind === 'interactive' || task.kind === 'continuity_edit')" class="result-detail">
               <summary>补充这个任务</summary>
               <form class="followup-form" @submit.prevent="submitFollowup(task)">
                 <textarea v-model="supplements[task.taskId]" rows="2" maxlength="2000" placeholder="补充要求；已结束的任务会作为新请求处理"></textarea>
                 <button type="submit" :disabled="status !== 'connected' || !(supplements[task.taskId] || '').trim()">发送补充</button>
               </form>
+            </details>
+            <details v-if="task.ownerId === userId && task.channel === 'room'" class="result-detail" @toggle="$event.target.open && (loadGitHubRepositories(), loadGitHub(task.taskId))">
+              <summary>GitHub 关联</summary>
+              <template v-if="githubLinks[task.taskId]?.link">
+                <a :href="`https://github.com/${githubLinks[task.taskId].link.repo}/pull/${githubLinks[task.taskId].link.pr}`" target="_blank" rel="noopener noreferrer">查看关联的 Pull Request #{{ githubLinks[task.taskId].link.pr }}</a>
+                <button type="button" class="link-button" @click="syncGitHub(task.taskId)">同步评论</button>
+                <small>已记录 {{ githubLinks[task.taskId].events.length }} 条反馈</small>
+              </template>
+              <form v-else class="followup-form" @submit.prevent="bindGitHub(task.taskId, githubRepo[task.taskId], githubPr[task.taskId])">
+                <select v-model="githubRepo[task.taskId]" aria-label="GitHub 项目"><option value="" disabled>选择项目</option><option v-for="repo in githubRepositories" :key="repo" :value="repo">{{ repo }}</option></select>
+                <input v-model.number="githubPr[task.taskId]" type="number" min="1" placeholder="已配置仓库的 PR 编号" aria-label="Pull Request 编号" />
+                <button type="submit" :disabled="!githubRepo[task.taskId] || !githubPr[task.taskId]">关联已有 PR</button>
+              </form>
+              <p v-if="githubErrors[task.taskId] && githubErrors[task.taskId] !== '未找到关联的 PR。'" class="error-text">{{ githubErrors[task.taskId] }}</p>
             </details>
             <details v-if="task.traces && task.traces.length" class="task-traces">
               <summary>{{ task.traces.length }} 步执行记录</summary>
@@ -185,8 +203,9 @@ function taskStatusLabel(value) {
 
         <section v-if="panel === 'automation'" class="automation-panel">
           <div class="panel-heading"><h2>主动能力</h2><span>{{ isAdmin ? '主机管理员' : '共享房间' }}</span></div>
-          <p class="panel-caption">提前准备线索，跟踪异常，在固定时间整理讨论。</p>
+          <p class="panel-caption">按需参与项目讨论，准备线索并整理讨论。</p>
           <div class="rule-controls">
+            <label><span>群聊主动协助<small>群消息和近期上下文会发送给模型判断，按成员独立处理，可能产生费用</small></span><input type="checkbox" :checked="automation.policy.autoReply" :disabled="!isAdmin || automationBusy || agent.demo" @change="setPolicy({ autoReply: $event.target.checked })" /></label>
             <label><span>静默预处理<small>报错出现后，准备只读定位线索</small></span><input type="checkbox" :checked="automation.policy.preprocess" :disabled="!isAdmin || automationBusy" @change="setPolicy({ preprocess: $event.target.checked })" /></label>
             <label><span>任务异常监控<small>仅在失败、停滞或恢复时通知</small></span><input type="checkbox" :checked="automation.policy.watchdog" :disabled="!isAdmin || automationBusy" @change="setPolicy({ watchdog: $event.target.checked })" /></label>
             <label><span>定时摘要<small>按北京时间整理共享房间记录</small></span><input type="checkbox" :checked="automation.policy.summary" :disabled="!isAdmin || automationBusy" @change="setPolicy({ summary: $event.target.checked })" /></label>

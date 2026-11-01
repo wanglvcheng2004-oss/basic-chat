@@ -15,6 +15,9 @@ export function useChat() {
   const notices = ref([])
   const automationError = ref('')
   const automationBusy = ref(false)
+  const githubRepositories = ref([])
+  const githubLinks = reactive({})
+  const githubErrors = reactive({})
   const automation = reactive({ policy: {}, prepared: [], summaries: [], budget: {}, recentIssues: [], invite: '' })
 
   const agent = reactive({ name: '小深', online: false, demo: false, allowWrite: true, maxWorkers: 3 })
@@ -38,6 +41,32 @@ export function useChat() {
     const data = await response.json()
     if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '请求未通过校验，请检查输入。')
     return data
+  }
+
+  async function loadGitHubRepositories() {
+    try { githubRepositories.value = (await api('/api/github/repositories')).repositories }
+    catch { githubRepositories.value = [] }
+  }
+
+  async function loadGitHub(taskId) {
+    try {
+      githubLinks[taskId] = await api(`/api/tasks/${encodeURIComponent(taskId)}/github`)
+      githubErrors[taskId] = ''
+    } catch (e) { githubLinks[taskId] = null; githubErrors[taskId] = e.message }
+  }
+
+  async function bindGitHub(taskId, repo, pr) {
+    try {
+      await api(`/api/tasks/${encodeURIComponent(taskId)}/github`, 'POST', { repo, pr: Number(pr) })
+      await loadGitHub(taskId)
+    } catch (e) { githubErrors[taskId] = e.message }
+  }
+
+  async function syncGitHub(taskId) {
+    try {
+      await api(`/api/tasks/${encodeURIComponent(taskId)}/github/sync`, 'POST')
+      await loadGitHub(taskId)
+    } catch (e) { githubErrors[taskId] = e.message }
   }
 
   async function refreshAutomation() {
@@ -144,6 +173,7 @@ export function useChat() {
           content: packet.content,
           timestamp: packet.timestamp,
           isAgent: true,
+          replyTo: packet.replyTo || null, replyToUserId: packet.replyToUserId || null, replyToName: packet.replyToName || null,
         }])
         scrollTo('.messages')
       } else {
@@ -264,6 +294,6 @@ export function useChat() {
     roomStreams, agentStreams,
     connect, send, sendAgent, stopTask, disconnect, followup,
     invite, isLocal, isAdmin, notices, dismissNotice, automation, automationError, automationBusy,
-    setPolicy, summarizeNow, refreshAutomation,
+    setPolicy, summarizeNow, refreshAutomation, githubRepositories, githubLinks, githubErrors, loadGitHubRepositories, loadGitHub, bindGitHub, syncGitHub,
   }
 }
