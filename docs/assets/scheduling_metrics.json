@@ -1,0 +1,89 @@
+{
+  "priority": {
+    "count": 150,
+    "avg_wait": 39.02451194036606,
+    "p95_wait": 150.50325768941207,
+    "max_wait": 389.12776879815806,
+    "avg_turnaround": 67.41204345185497,
+    "makespan": 1128.028691999857,
+    "throughput_per_min": 7.978520461251832
+  },
+  "fifo": {
+    "count": 150,
+    "avg_wait": 37.16149672527079,
+    "p95_wait": 64.21216430212434,
+    "max_wait": 73.16262405400118,
+    "avg_turnaround": 65.54902823675971,
+    "makespan": 1121.1815323692526,
+    "throughput_per_min": 8.027246025878991
+  },
+  "urgent": {
+    "priority": {
+      "count": 73,
+      "avg_wait": 10.266489298820058,
+      "p95_wait": 34.566761283727494,
+      "max_wait": 73.70777852090544
+    },
+    "fifo": {
+      "count": 73,
+      "avg_wait": 34.08479494714728,
+      "p95_wait": 63.17774903344389,
+      "max_wait": 73.16262405400118
+    }
+  },
+  "per_project": {
+    "core": {
+      "priority": {
+        "count": 71,
+        "avg_wait": 8.271656509910901,
+        "p95_wait": 27.417404863131072,
+        "max_wait": 40.15590523816101
+      },
+      "fifo": {
+        "count": 71,
+        "avg_wait": 35.87645996184493,
+        "p95_wait": 63.90997561484229,
+        "max_wait": 73.16262405400118
+      },
+      "policy_priority": 5,
+      "policy_weight": 0.5
+    },
+    "growth": {
+      "priority": {
+        "count": 47,
+        "avg_wait": 27.546348911608572,
+        "p95_wait": 80.00106835754923,
+        "max_wait": 110.5224964284735
+      },
+      "fifo": {
+        "count": 47,
+        "avg_wait": 37.308884992791135,
+        "p95_wait": 63.92415345055703,
+        "max_wait": 66.1454817659278
+      },
+      "policy_priority": 3,
+      "policy_weight": 0.3
+    },
+    "debt": {
+      "priority": {
+        "count": 32,
+        "avg_wait": 124.115961875176,
+        "p95_wait": 308.85750678535385,
+        "max_wait": 389.12776879815806
+      },
+      "fifo": {
+        "count": 32,
+        "avg_wait": 39.79619552620143,
+        "p95_wait": 58.38821476450565,
+        "max_wait": 64.31537371214489
+      },
+      "policy_priority": 1,
+      "policy_weight": 0.2
+    }
+  },
+  "quotas": {
+    "core": 2,
+    "growth": 1,
+    "debt": 1
+  }
+}

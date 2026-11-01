@@ -1,0 +1,56 @@
+{
+  "nodes": 15,
+  "edges": 44,
+  "density": 0.419,
+  "avg_degree": 5.87,
+  "communities": 4,
+  "top_relationships": [
+    {
+      "source": "测试",
+      "target": "运维",
+      "weight": 105
+    },
+    {
+      "source": "算法",
+      "target": "数据",
+      "weight": 96
+    },
+    {
+      "source": "后端",
+      "target": "开源",
+      "weight": 94
+    },
+    {
+      "source": "产品",
+      "target": "算法",
+      "weight": 89
+    },
+    {
+      "source": "数据",
+      "target": "增长",
+      "weight": 89
+    },
+    {
+      "source": "运营",
+      "target": "增长",
+      "weight": 88
+    },
+    {
+      "source": "产品",
+      "target": "测试",
+      "weight": 71
+    },
+    {
+      "source": "设计",
+      "target": "增长",
+      "weight": 66
+    }
+  ],
+  "memory_example": [
+    {
+      "user": "u-产品",
+      "content": "产品 偏好结构化、先结论后细节的回复",
+      "importance": 4
+    }
+  ]
+}
