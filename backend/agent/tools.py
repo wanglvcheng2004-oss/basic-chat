@@ -6,10 +6,11 @@ from pathlib import Path
 from .config import ROOT
 from .store import AgentStore
 from .types import Task
+from ..access import can_read_thread
 
 MAX_READ_CHARS = 8000
 MAX_WRITE_CHARS = 20000
-BLOCKED_PARTS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", "tools"}
+BLOCKED_PARTS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", "tools", ".data", ".state", "data", ".codex", ".review-venv"}
 BLOCKED_FILES = {".env"}
 
 
@@ -107,9 +108,10 @@ def _safe_path(raw: str) -> Path:
         relative = resolved.relative_to(ROOT)
     except ValueError as exc:
         raise ToolError("只能访问项目工作区内的文件") from exc
-    if any(part in BLOCKED_PARTS for part in relative.parts):
+    if any(part.casefold() in BLOCKED_PARTS for part in relative.parts):
         raise ToolError("该路径被禁止访问")
-    if relative.name in BLOCKED_FILES or relative.name.startswith(".env"):
+    name = relative.name.casefold()
+    if name.startswith(".env") or any(suffix in name for suffix in ('.sqlite', '.db', '.pem', '.key')):
         raise ToolError("环境变量文件禁止访问")
     return resolved
 
@@ -125,8 +127,10 @@ async def execute_tool(
     try:
         if name == "read_thread":
             thread_id = str(args.get("thread_id") or task.thread_id)
+            if not can_read_thread(task, thread_id):
+                raise ToolError('没有读取该会话的权限')
             limit = max(1, min(int(args.get("limit") or 20), 50))
-            messages = store.thread_messages(thread_id, limit=limit)
+            messages = await store.history(thread_id, limit=limit)
             related = [item.public() for item in store.tasks.values() if item.thread_id == thread_id][-5:]
             return _json(
                 {
@@ -146,14 +150,16 @@ async def execute_tool(
             )
 
         if name == "read_message":
-            message = store.get_message(str(args.get("message_id") or ""))
+            message = await store.lookup_message(str(args.get("message_id") or ""))
             if message is None:
                 raise ToolError("找不到该消息")
+            if not can_read_thread(task, message.thread_id):
+                raise ToolError('没有读取该消息的权限')
             return _json(message.as_packet())
 
         if name == "list_tasks":
             limit = max(1, min(int(args.get("limit") or 10), 30))
-            tasks = sorted(store.tasks.values(), key=lambda item: item.created_at)[-limit:]
+            tasks = sorted((item for item in store.tasks.values() if can_read_thread(task, item.thread_id)), key=lambda item: item.created_at)[-limit:]
             return _json({"tasks": [item.public() for item in tasks]})
 
         if name == "read_file":
@@ -161,7 +167,8 @@ async def execute_tool(
             if not path.is_file():
                 raise ToolError("文件不存在或不是普通文件")
             limit = max(200, min(int(args.get("max_chars") or 4000), MAX_READ_CHARS))
-            text = path.read_text(encoding="utf-8", errors="replace")
+            with path.open(encoding="utf-8", errors="replace") as file:
+                text = file.read(limit + 1)
             return _json(
                 {
                     "path": str(path.relative_to(ROOT)).replace("\\", "/"),
@@ -172,7 +179,7 @@ async def execute_tool(
             )
 
         if name == "write_file":
-            if not allow_write:
+            if not allow_write or getattr(task, 'kind', 'interactive') != 'interactive':
                 raise ToolError("当前未开启写入权限")
             content = str(args.get("content") or "")
             if len(content) > MAX_WRITE_CHARS:
@@ -204,6 +211,10 @@ async def execute_tool(
                 if len(relative.parts) > depth + len(root.relative_to(ROOT).parts):
                     continue
                 if any(part in BLOCKED_PARTS for part in relative.parts):
+                    continue
+                try:
+                    _safe_path(str(relative))
+                except ToolError:
                     continue
                 suffix = "/" if item.is_dir() else ""
                 entries.append(str(relative).replace("\\", "/") + suffix)

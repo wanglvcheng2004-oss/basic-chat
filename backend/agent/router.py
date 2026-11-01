@@ -56,13 +56,14 @@ class Router:
                     await self.runtime.notify(trigger, f"模型调用失败：{exc}")
                 except Exception as exc:  # 单条事件失败不应终止 Router
                     await self.runtime.notify(trigger, f"处理失败：{exc}")
+                finally:
+                    self.store.finish_event(trigger.id)
+                    await self.store.flush()
 
     async def route(self, trigger: Trigger) -> None:
-        worker = self.runtime.registry.get(trigger.thread_id)
-        if worker is not None and worker.deliver(trigger):
-            # 直通：同一 Thread 的后续事件直接进入已订阅的 Worker。
-            return
-        await self.decide(trigger)
+        # A room is a visibility scope, never the identity of a running task.
+        async with self.runtime.dispatcher.slot('router:' + trigger.id):
+            await self.decide(trigger)
 
     async def decide(self, trigger: Trigger) -> None:
         messages = build_router_messages(self.config, self.store, trigger)

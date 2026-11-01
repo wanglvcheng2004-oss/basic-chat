@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .types import Trigger, dm_thread, new_id
 
 ROOM_THREAD = "room:main"
@@ -16,9 +18,10 @@ class TriggerBuilder:
         if not text or user_id == "agent":
             return None
         marker = f"@{self.name}"
-        if marker not in text:
+        match = re.search(r'(?<!\S)' + re.escape(marker) + r'(?=$|\s|[，。！？、,.!?;；：:])', text)
+        if match is None:
             return None
-        cleaned = text.replace(marker, " ", 1).strip()
+        cleaned = (text[:match.start()] + ' ' + text[match.end():]).strip()
         return Trigger(
             id=new_id("trg"),
             thread_id=ROOM_THREAD,

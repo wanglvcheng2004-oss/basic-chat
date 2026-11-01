@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, reactive, ref } from 'vue'
 import { useChat } from './composables/useChat'
 import { insertMention, mentionQuery } from './mention'
 
@@ -8,8 +8,18 @@ const {
   agent, agentMessages, agentDraft, agentError, taskList, activeTasks,
   roomStreams, agentStreams,
   connect, send, sendAgent, stopTask, disconnect,
+  followup, invite, isLocal, isAdmin, notices, dismissNotice,
+  automation, automationError, automationBusy, setPolicy, summarizeNow, refreshAutomation,
 } = useChat()
 
+const panel = ref('private')
+const showInvite = ref(false)
+const supplements = reactive({})
+const newResults = computed(() => automation.prepared.length + notices.value.length)
+function submitFollowup(task) {
+  if (followup(task.taskId, supplements[task.taskId] || '')) supplements[task.taskId] = ''
+}
+function dateLabel(iso) { return iso ? new Date(iso).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '' }
 const draft = ref('')
 const composerInput = ref(null)
 const mentionOpen = ref(false)
@@ -76,6 +86,11 @@ function taskStatusLabel(value) {
       <form class="join-form" @submit.prevent="join">
         <label for="nickname">你的昵称</label>
         <input id="nickname" v-model="nickname" maxlength="20" autofocus placeholder="例如：小雨" />
+        <template v-if="!isLocal">
+          <label for="invite">房间邀请码</label>
+          <input id="invite" v-model="invite" type="password" autocomplete="off" placeholder="向主机管理员获取" />
+        </template>
+        <small v-else class="join-hint">从主机本地加入后，可管理主动规则并查看队友邀请码。</small>
         <button type="submit">进入聊天室 <span>→</span></button>
       </form>
       <p v-if="error" class="error-text">{{ error }}</p>
@@ -124,22 +139,39 @@ function taskStatusLabel(value) {
           <div class="agent-avatar">深</div>
           <div class="agent-title">
             <strong>{{ agent.name }}</strong>
-            <span>Super-agent · Router + {{ agent.backend === 'dsh' ? 'Harness' : 'Worker' }}</span>
+            <span>{{ agent.allowWrite ? '项目助手 · 可编辑文件' : '项目助手 · 只读运行' }}</span>
           </div>
           <span :class="['status-dot', agent.online ? 'connected' : '']"></span>
         </header>
 
-        <p v-if="agent.demo" class="agent-banner">演示模式：在项目根目录 .env 填入 LLM_API_KEY 后重启，即可启用真实模型。</p>
-        <p v-else-if="activeTasks.length" class="agent-banner busy">{{ activeTasks.length }} 个任务正在后台执行，互不阻塞。</p>
+        <p v-if="agent.demo" class="agent-banner">演示模式：当前结果由固定规则生成，未调用真实模型。</p>
+        <p v-else-if="activeTasks.length" class="agent-banner busy">{{ activeTasks.length }} 个任务正在排队或执行。</p>
+        <nav class="assistant-tabs" aria-label="助手面板">
+          <button :class="{ selected: panel === 'private' }" @click="panel = 'private'">私聊</button>
+          <button :class="{ selected: panel === 'tasks' }" @click="panel = 'tasks'">任务 <small>{{ taskList.length }}</small></button>
+          <button :class="{ selected: panel === 'automation' }" @click="panel = 'automation'; refreshAutomation()">主动能力 <small v-if="newResults">{{ newResults }}</small></button>
+        </nav>
 
-        <section v-if="taskList.length" class="task-board">
+        <section v-if="panel === 'tasks'" class="task-board task-panel">
+          <p v-if="!taskList.length" class="panel-empty">任务开始后，进度和结果会保存在这里。</p>
           <article v-for="task in taskList" :key="task.taskId" :class="['task-card', task.status]">
             <div class="task-row">
               <span class="task-title">{{ task.title }}</span>
-              <span class="task-status">{{ taskStatusLabel(task.status) }}</span>
-              <button v-if="task.status === 'queued' || task.status === 'running'" class="task-stop" @click="stopTask(task.taskId)">停止</button>
+              <span class="task-status">{{ task.retryPending ? '等待重试' : taskStatusLabel(task.status) }}</span>
+              <button v-if="task.ownerId === userId && (task.status === 'queued' || task.status === 'running' || task.retryPending)" class="task-stop" @click="stopTask(task.taskId)">停止</button>
             </div>
-            <p v-if="task.output" class="task-output">{{ task.output }}</p>
+            <p v-if="task.health === 'suspected_stall'" class="error-text">疑似停滞：暂未收到新的执行信号。</p>
+            <p v-if="task.error" class="error-text">{{ task.error }}</p>
+            <details v-if="task.output || task.result" class="result-detail">
+              <summary>查看结果</summary><p>{{ task.result || task.output }}</p>
+            </details>
+            <details v-if="task.ownerId === userId && (!task.kind || task.kind === 'interactive')" class="result-detail">
+              <summary>补充这个任务</summary>
+              <form class="followup-form" @submit.prevent="submitFollowup(task)">
+                <textarea v-model="supplements[task.taskId]" rows="2" maxlength="2000" placeholder="补充要求；已结束的任务会作为新请求处理"></textarea>
+                <button type="submit" :disabled="status !== 'connected' || !(supplements[task.taskId] || '').trim()">发送补充</button>
+              </form>
+            </details>
             <details v-if="task.traces && task.traces.length" class="task-traces">
               <summary>{{ task.traces.length }} 步执行记录</summary>
               <ul>
@@ -151,10 +183,57 @@ function taskStatusLabel(value) {
           </article>
         </section>
 
-        <div class="agent-messages" aria-live="polite">
+        <section v-if="panel === 'automation'" class="automation-panel">
+          <div class="panel-heading"><h2>主动能力</h2><span>{{ isAdmin ? '主机管理员' : '共享房间' }}</span></div>
+          <p class="panel-caption">提前准备线索，跟踪异常，在固定时间整理讨论。</p>
+          <div class="rule-controls">
+            <label><span>静默预处理<small>报错出现后，准备只读定位线索</small></span><input type="checkbox" :checked="automation.policy.preprocess" :disabled="!isAdmin || automationBusy" @change="setPolicy({ preprocess: $event.target.checked })" /></label>
+            <label><span>任务异常监控<small>仅在失败、停滞或恢复时通知</small></span><input type="checkbox" :checked="automation.policy.watchdog" :disabled="!isAdmin || automationBusy" @change="setPolicy({ watchdog: $event.target.checked })" /></label>
+            <label><span>定时摘要<small>按北京时间整理共享房间记录</small></span><input type="checkbox" :checked="automation.policy.summary" :disabled="!isAdmin || automationBusy" @change="setPolicy({ summary: $event.target.checked })" /></label>
+          </div>
+          <div class="summary-time">
+            <label for="summary-hour">每日</label>
+            <input id="summary-hour" type="number" min="0" max="23" :value="automation.policy.hour ?? 19" :disabled="!isAdmin || automationBusy" @change="setPolicy({ hour: Number($event.target.value) })" aria-label="摘要小时" />
+            <span>:</span><input type="number" min="0" max="59" :value="automation.policy.minute ?? 0" :disabled="!isAdmin || automationBusy" @change="setPolicy({ minute: Number($event.target.value) })" aria-label="摘要分钟" />
+            <button v-if="isAdmin" :disabled="automationBusy || !automation.policy.summary" @click="summarizeNow">生成当前摘要</button>
+          </div>
+          <p class="quota-label">今日后台调用 {{ automation.budget.used || 0 }} / {{ automation.budget.limit || 30 }} · 为摘要保留 3 次</p>
+          <p v-if="!isAdmin" class="panel-caption">规则由主机管理员调整。</p>
+          <details v-if="isAdmin" class="invite-detail">
+            <summary>队友邀请码</summary>
+            <div class="invite-row"><input :type="showInvite ? 'text' : 'password'" readonly :value="automation.invite" aria-label="队友邀请码" /><button @click="showInvite = !showInvite">{{ showInvite ? '隐藏' : '显示' }}</button></div>
+            <small>邀请码允许加入共享房间。私聊和任务归属仍按各自会话保存。</small>
+          </details>
+          <p v-if="automationError" class="error-text">{{ automationError }}</p>
+          <section v-if="notices.length" class="notification-list">
+            <h3>通知 <small>{{ notices.length }}</small></h3>
+            <article v-for="notice in notices" :key="notice.id"><p>{{ notice.message }}</p><button @click="dismissNotice(notice.id)">已读</button></article>
+          </section>
+          <h3>已准备 <small>{{ automation.prepared.length }}</small></h3>
+          <p v-if="!automation.prepared.length" class="panel-empty">暂无有效线索。启用后，明确报错会自动触发；结果保留 30 分钟。</p>
+          <details v-for="item in automation.prepared" :key="item.id" class="automation-result" open>
+            <summary>报错定位线索 <time>{{ dateLabel(item.createdAt) }}</time></summary>
+            <p>{{ item.content }}</p>
+            <small>来源 {{ item.sources.length }} 条消息 · 引用文件 {{ Object.keys(item.files).join('、') || '无' }}</small>
+            <small>有效至 {{ dateLabel(item.expiresAt) }}；文件变化后自动失效。</small>
+          </details>
+          <h3>房间摘要 <small>{{ automation.summaries.length }}</small></h3>
+          <p v-if="!automation.summaries.length" class="panel-empty">暂无摘要。启用后从当前时间开始记录；空窗口会自动跳过。</p>
+          <details v-for="item in automation.summaries" :key="item.id" class="automation-result">
+            <summary>{{ item.catchup ? '补摘要' : '讨论摘要' }} <time>{{ dateLabel(item.end) }}</time></summary>
+            <small>{{ dateLabel(item.start) }} — {{ dateLabel(item.end) }} · {{ item.coveredCount }} / {{ item.sourceCount }} 条</small>
+            <p>{{ item.content }}</p>
+          </details>
+          <details v-if="automation.recentIssues.length" class="result-detail">
+            <summary>最近未完成的后台事项</summary>
+            <p v-for="issue in automation.recentIssues" :key="issue.id">{{ issue.kind === 'summary' ? '摘要' : '预处理' }}：{{ issue.error || taskStatusLabel(issue.status) }}</p>
+          </details>
+        </section>
+
+        <div v-if="panel === 'private'" class="agent-messages" aria-live="polite">
           <div v-if="!agentMessages.length && !agentStreams.length" class="agent-empty">
             <span>✦</span>
-            <p>把任务交给 {{ agent.name }}，Router 会分派给后台 Worker 并在这里汇报进度。</p>
+            <p>这里是你与 {{ agent.name }} 的私聊。共享讨论留在左侧，任务进度与主动结果在上方查看。</p>
           </div>
           <article v-for="message in agentMessages" :key="message.id" :class="['agent-message', message.role]">
             <div class="agent-message-meta">
@@ -169,8 +248,8 @@ function taskStatusLabel(value) {
           </article>
         </div>
 
-        <form class="agent-composer" @submit.prevent="submitAgent">
-          <textarea v-model="agentDraft" maxlength="2000" rows="2" :disabled="status !== 'connected'" placeholder="私聊智能体，或让它改代码…" @keydown="onAgentKeydown"></textarea>
+        <form v-if="panel === 'private'" class="agent-composer" @submit.prevent="submitAgent">
+          <textarea v-model="agentDraft" maxlength="2000" rows="2" :disabled="status !== 'connected'" placeholder="把问题或任务告诉智能体…" @keydown="onAgentKeydown"></textarea>
           <button type="submit" :disabled="status !== 'connected' || !agentDraft.trim()" aria-label="发送给智能体">↑</button>
         </form>
         <p v-if="agentError" class="error-text agent-error">{{ agentError }}</p>

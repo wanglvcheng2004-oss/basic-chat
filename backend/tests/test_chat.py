@@ -24,9 +24,11 @@ def test_connection_manager_count():
     assert manager.count == 0
 
 
-def test_presence_lists_members_on_join_and_leave(monkeypatch):
+def test_presence_lists_members_on_join_and_leave(tmp_path):
     from fastapi.testclient import TestClient
-    from backend.main import app
+    from backend.main import create_app
+    from backend.agent.config import AgentConfig
+    app = create_app(AgentConfig(data_dir=str(tmp_path)))
 
     def receive_presence(socket):
         while True:
@@ -34,13 +36,17 @@ def test_presence_lists_members_on_join_and_leave(monkeypatch):
             if packet['type'] == 'presence':
                 return packet
 
-    with TestClient(app) as client:
-        with client.websocket_connect('/ws?nickname=Alice') as first:
+    with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 5000)) as client:
+        client.post('/api/session', json={'nickname': 'Alice'})
+        with client.websocket_connect('ws://127.0.0.1/ws') as first:
             first_ready = first.receive_json()
             assert first_ready['members'] == [{'userId': first_ready['userId'], 'nickname': 'Alice'}]
             receive_presence(first)
-            with client.websocket_connect('/ws?nickname=Bob') as second:
+            client.cookies.clear()
+            client.post('/api/session', json={'nickname': 'Bob'})
+            with client.websocket_connect('ws://127.0.0.1/ws') as second:
                 second_ready = second.receive_json()
                 assert {x['nickname'] for x in second_ready['members']} == {'Alice', 'Bob'}
                 assert {x['nickname'] for x in receive_presence(first)['members']} == {'Alice', 'Bob'}
-            assert [x['nickname'] for x in receive_presence(first)['members']] == ['Alice']
+                second.close()
+                assert [x['nickname'] for x in receive_presence(first)['members']] == ['Alice']

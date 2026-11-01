@@ -295,6 +295,8 @@ def test_worker_uses_dsh_backend(tmp_path: Path):
         config = AgentConfig(
             name="小深",
             dsh_enabled=True,
+            dsh_policy_verified=True,
+            allow_write=True,
             dsh_command=str(command),
             dsh_timeout=30,
             worker_model="deepseek-flash",

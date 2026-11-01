@@ -8,4 +8,8 @@ tools/
 *.log
 .env
 .env.local
+.state/
+.data/
+*.sqlite3*
+artifacts/
 

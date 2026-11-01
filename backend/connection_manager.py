@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 from uuid import uuid4
 
 from fastapi import WebSocket
@@ -11,6 +12,8 @@ class Client:
     user_id: str
     nickname: str
     socket: WebSocket
+    connection_id: str = ''
+    admin: bool = False
 
 
 class ConnectionManager:
@@ -19,39 +22,36 @@ class ConnectionManager:
 
     @property
     def count(self) -> int:
-        return len(self.connections)
+        return len({client.user_id for client in self.connections.values()})
 
     def members(self) -> list[dict[str, str]]:
-        return [{"userId": client.user_id, "nickname": client.nickname} for client in self.connections.values()]
+        unique = {client.user_id: client for client in self.connections.values()}
+        return [{"userId": client.user_id, "nickname": client.nickname} for client in unique.values()]
 
-    def add(self, nickname: str, socket: WebSocket) -> Client:
-        client = Client(str(uuid4()), nickname, socket)
-        self.connections[client.user_id] = client
+    def add(self, nickname: str, socket: WebSocket, user_id=None, admin=False) -> Client:
+        connection_id = str(uuid4())
+        client = Client(user_id or connection_id, nickname, socket, connection_id, admin)
+        self.connections[connection_id] = client
         return client
 
-    def remove(self, user_id: str) -> None:
-        self.connections.pop(user_id, None)
+    def remove(self, connection_id: str) -> None:
+        self.connections.pop(connection_id, None)
 
     async def send(self, client: Client, packet: dict) -> None:
-        await client.socket.send_json(packet)
+        await asyncio.wait_for(client.socket.send_json(packet), 3)
 
     async def send_to(self, user_id: str, packet: dict) -> bool:
-        client = self.connections.get(user_id)
-        if client is None:
-            return False
+        clients = [c for c in list(self.connections.values()) if c.user_id == user_id]
+        results = await asyncio.gather(*(self._try_send(c, packet) for c in clients))
+        return any(results)
+
+    async def _try_send(self, client, packet):
         try:
-            await client.socket.send_json(packet)
+            await self.send(client, packet)
             return True
         except Exception:
-            self.remove(user_id)
+            self.remove(client.connection_id)
             return False
 
     async def broadcast(self, packet: dict) -> None:
-        stale: list[str] = []
-        for user_id, client in list(self.connections.items()):
-            try:
-                await client.socket.send_json(packet)
-            except Exception:
-                stale.append(user_id)
-        for user_id in stale:
-            self.remove(user_id)
+        await asyncio.gather(*(self._try_send(c, packet) for c in list(self.connections.values())))

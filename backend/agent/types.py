@@ -43,6 +43,8 @@ class Message:
     content: str
     created_at: str
     user_id: str = ""
+    kind: str = 'chat'
+    task_id: str = ''
 
     def as_packet(self) -> dict:
         return {
@@ -56,6 +58,8 @@ class Message:
             "content": self.content,
             "timestamp": self.created_at,
             "isAgent": self.role == "agent",
+            'kind': self.kind,
+            'taskId': self.task_id or None,
         }
 
 
@@ -75,6 +79,15 @@ class Task:
     steps: int = 0
     result: str = ""
     error: str = ""
+    kind: str = 'interactive'
+    source_id: str = ''
+    reason_code: str = ''
+    deadline_at: float = 0
+    last_signal_at: float = 0
+    last_progress_at: float = 0
+    health: str = 'normal'
+    health_revision: int = 0
+    retry_pending: bool = False
 
     def public(self) -> dict:
         return {
@@ -91,4 +104,8 @@ class Task:
             "error": self.error,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
+            'kind': self.kind,
+            'reasonCode': self.reason_code,
+            'health': self.health,
+            'retryPending': self.retry_pending,
         }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,7 +72,7 @@ class AgentConfig:
     spill_chars: int = 300
     rate_limit: int = 12
     rate_window: float = 60.0
-    allow_write: bool = True
+    allow_write: bool = False
     dsh_enabled: bool = False
     dsh_command: str = "dsh"
     dsh_profile: str = "headless"
@@ -80,6 +81,11 @@ class AgentConfig:
     dsh_extra_args: str = ""
     dsh_timeout: float = 1800.0
     dsh_home: str = ""
+    dsh_policy_verified: bool = False
+    data_dir: str = ''
+    task_timeout: float = 600.0
+    heartbeat_interval: float = 10.0
+    stall_seconds: float = 180.0
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -98,14 +104,14 @@ class AgentConfig:
             router_max_tokens=_int("ROUTER_MAX_TOKENS", 400),
             worker_max_tokens=_int("WORKER_MAX_TOKENS", 1600),
             request_timeout=_float("LLM_TIMEOUT", 180.0),
-            max_workers=max(1, _int("MAX_WORKERS", 3)),
+            max_workers=max(2, _int("MAX_WORKERS", 3)),
             max_steps=max(1, _int("MAX_STEPS", 8)),
             batch_size=max(1, _int("ROUTER_BATCH", 6)),
             history_limit=max(4, _int("HISTORY_LIMIT", 16)),
             spill_chars=max(80, _int("SPILL_CHARS", 300)),
             rate_limit=max(1, _int("RATE_LIMIT", 12)),
             rate_window=max(1.0, _float("RATE_WINDOW", 60.0)),
-            allow_write=_bool("AGENT_ALLOW_WRITE", True),
+            allow_write=_bool("AGENT_ALLOW_WRITE", False),
             dsh_enabled=_bool("HARNESS_ENABLED", False),
             dsh_command=os.getenv("HARNESS_COMMAND", "dsh").strip() or "dsh",
             dsh_profile=os.getenv("HARNESS_PROFILE", "headless").strip() or "headless",
@@ -114,8 +120,21 @@ class AgentConfig:
             dsh_extra_args=os.getenv("HARNESS_EXTRA_ARGS", "").strip(),
             dsh_timeout=max(30.0, _float("HARNESS_TIMEOUT", 1800.0)),
             dsh_home=os.getenv("HARNESS_HOME", "").strip(),
+            dsh_policy_verified=_bool('HARNESS_POLICY_VERIFIED', False),
+            data_dir=os.getenv('CHAT_DATA_DIR', '').strip(),
+            task_timeout=max(30., _float('TASK_TIMEOUT', 600.)),
+            heartbeat_interval=max(1., _float('HEARTBEAT_INTERVAL', 10.)),
+            stall_seconds=max(10., _float('STALL_SECONDS', 180.)),
         )
 
     @property
     def demo_mode(self) -> bool:
         return not self.api_key
+
+    @property
+    def state_path(self) -> Path:
+        if self.data_dir:
+            return Path(self.data_dir).expanduser().resolve()
+        base = Path(os.getenv('LOCALAPPDATA') or (Path.home() / '.local' / 'share'))
+        workspace_key = hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
+        return base / 'basic-chat' / workspace_key
