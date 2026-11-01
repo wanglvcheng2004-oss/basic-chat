@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +82,9 @@ class AgentConfig:
     dsh_timeout: float = 1800.0
     dsh_home: str = ""
     dsh_policy_verified: bool = False
+    github_write_enabled: bool = False
+    github_projects: str = ''
+    github_token: str = field(default='', repr=False)
     data_dir: str = ''
     task_timeout: float = 600.0
     heartbeat_interval: float = 10.0
@@ -121,6 +124,9 @@ class AgentConfig:
             dsh_timeout=max(30.0, _float("HARNESS_TIMEOUT", 1800.0)),
             dsh_home=os.getenv("HARNESS_HOME", "").strip(),
             dsh_policy_verified=_bool('HARNESS_POLICY_VERIFIED', False),
+            github_write_enabled=_bool('CONTINUITY_GITHUB_WRITE_ENABLED', False),
+            github_projects=os.getenv('CONTINUITY_GITHUB_PROJECTS', '').strip(),
+            github_token=os.getenv('CONTINUITY_GITHUB_TOKEN', '').strip(),
             data_dir=os.getenv('CHAT_DATA_DIR', '').strip(),
             task_timeout=max(30., _float('TASK_TIMEOUT', 600.)),
             heartbeat_interval=max(1., _float('HEARTBEAT_INTERVAL', 10.)),

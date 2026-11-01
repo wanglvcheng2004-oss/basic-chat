@@ -30,6 +30,10 @@ class Trigger:
     content: str
     message_id: str = ""
     source: str = "chat"
+    continuity_repo: str = ""
+    continuity_pr: int = 0
+    continuity_task_id: str = ""
+    needs_code_change: bool = False
     created_at: str = field(default_factory=now_iso)
 
 
@@ -45,6 +49,9 @@ class Message:
     user_id: str = ""
     kind: str = 'chat'
     task_id: str = ''
+    reply_to: str = ''
+    reply_to_user_id: str = ''
+    reply_to_name: str = ''
 
     def as_packet(self) -> dict:
         return {
@@ -60,6 +67,9 @@ class Message:
             "isAgent": self.role == "agent",
             'kind': self.kind,
             'taskId': self.task_id or None,
+            'replyTo': self.reply_to or None,
+            'replyToUserId': self.reply_to_user_id or None,
+            'replyToName': self.reply_to_name or None,
         }
 
 
@@ -81,6 +91,7 @@ class Task:
     error: str = ""
     kind: str = 'interactive'
     source_id: str = ''
+    continuity_id: str = ''
     reason_code: str = ''
     deadline_at: float = 0
     last_signal_at: float = 0
@@ -105,6 +116,7 @@ class Task:
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             'kind': self.kind,
+            'continuityId': self.continuity_id or None,
             'reasonCode': self.reason_code,
             'health': self.health,
             'retryPending': self.retry_pending,

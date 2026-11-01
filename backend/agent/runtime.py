@@ -50,6 +50,10 @@ class AgentRuntime:
         self.dispatcher = Dispatcher(config.max_workers)
         self.watchdog = Watchdog(self)
         self.automation = None
+        self.github_gateway = None
+        self.continuity_store = None
+        self._continuity_runs = {}
+        self._continuity_locks = {}
         self._ticker = None
         self.instance_id = new_id('runtime')
         self._last_tick = 0.0
@@ -82,6 +86,11 @@ class AgentRuntime:
             self._router_task.cancel()
             await asyncio.gather(self._router_task, return_exceptions=True)
             self._router_task = None
+        if self.automation is not None:
+            for decision in list(self.automation._decisions):
+                decision.cancel()
+            if self.automation._decisions:
+                await asyncio.gather(*list(self.automation._decisions), return_exceptions=True)
         jobs = list(self._workers.values())
         for job in jobs:
             job.cancel()
@@ -172,7 +181,7 @@ class AgentRuntime:
         if task is None or task.owner_id != client.user_id:
             await self._notify_user(client, '只能补充自己发起的任务。')
             return
-        if task.kind != 'interactive':
+        if task.kind not in {'interactive', 'continuity_edit'}:
             await self._notify_user(client, '后台分析使用固定输入，请发起新的问题。')
             return
         if not self._allow(client.user_id):
@@ -180,13 +189,23 @@ class AgentRuntime:
             return
         message = self.store.add_message(thread_id=task.thread_id, channel=task.channel, role='user',
             nickname=client.nickname, content=content, user_id=client.user_id)
+        linked = None
+        if task.kind == 'continuity_edit' and self.continuity_store is not None:
+            linked = await self.continuity_store.get(task.continuity_id or task.id, client.user_id)
         trigger = Trigger(id=new_id('trg'), thread_id=task.thread_id, channel=task.channel,
                           owner_id=client.user_id, owner_name=client.nickname, content=content,
-                          source='followup', message_id=message.id)
+                          source='continuity_followup' if linked else 'followup', message_id=message.id,
+                          continuity_repo=linked['repo'] if linked else '', continuity_pr=linked['pr'] if linked else 0,
+                          continuity_task_id=linked['task_id'] if linked else '', needs_code_change=bool(linked))
         worker = self._sessions.get(task.id)
         self.store.record_event(trigger, task.id)
         await self.store.flush()
-        await self._emit(task.channel, task.owner_id, {'type': 'chat' if task.channel == 'room' else 'agent.message', **message.as_packet()})
+        public_message = message
+        if task.channel == 'room' and task.thread_id != ROOM_THREAD:
+            public_message = self.store.add_message(thread_id=ROOM_THREAD, channel='room', role='user', nickname=client.nickname,
+                content=content, user_id=client.user_id, kind='chat')
+            await self.store.flush()
+        await self._emit(task.channel, task.owner_id, {'type': 'chat' if task.channel == 'room' else 'agent.message', **public_message.as_packet()})
         if task.status in {'queued', 'running'} and worker is not None and worker.deliver(trigger):
             return
         # The close gate is synchronous: late input becomes a new request.
@@ -227,7 +246,7 @@ class AgentRuntime:
         if task.owner_id != client.user_id:
             await self._notify_user(client, "只能停止自己发起的任务。")
             return
-        if task.kind != 'interactive' and self.automation is not None:
+        if task.kind not in {'interactive', 'auto_assist', 'continuity_edit'} and self.automation is not None:
             await self.automation.stop_source(task)
             return
         if task.status not in {"queued", "running"}:
@@ -258,14 +277,57 @@ class AgentRuntime:
         await self.emit_state(task)
         if reason in {'timeout', 'interrupted'}:
             await self.notice(task, text, 'abnormal:' + reason)
-        if task.kind == 'interactive':
+        if task.kind in {'interactive', 'auto_assist', 'continuity_edit'}:
             await self._deliver(task, text, f'msg_{task.id}_out')
-        if self.automation is not None and task.kind != 'interactive':
+        if self.automation is not None and task.kind not in {'interactive', 'auto_assist', 'continuity_edit'}:
             await self.automation.settled(task)
         for event_id, event in self.store.events.items():
             if event.get('task_id') == task.id and event.get('state') == 'queued':
                 self.store.finish_event(event_id, 'cancelled', task.id)
         await self.store.flush()
+
+    async def on_github_status(self, link, pr):
+        import hashlib
+        status = 'merged' if pr['merged'] else pr['state']
+        stable_id = 'github_status_' + hashlib.sha256(f"{link['repo']}#{link['pr']}:{status}".encode()).hexdigest()[:24]
+        if await self.store.lookup_message(stable_id):
+            return
+        label = '已合并' if pr['merged'] else ('已关闭' if pr['state'] == 'closed' else '已重新打开')
+        url = f"https://github.com/{link['repo']}/pull/{link['pr']}"
+        message = self.store.add_message(thread_id=ROOM_THREAD, channel='room', role='agent', nickname=self.config.name,
+            user_id=AGENT_USER_ID, content=f'Pull Request {label}：{url}', message_id=stable_id, kind='github_status')
+        await self.store.flush()
+        await self.manager.broadcast({'type': 'chat', **message.as_packet()})
+
+    async def on_github_feedback(self, link, event):
+        task = self.store.get_task(link['task_id'])
+        if task is None or task.owner_id != link['owner_id'] or task.channel != 'room':
+            raise ValueError('关联的公开任务不存在')
+        import hashlib
+        event_key = '|'.join(str(event[k]) for k in ('repo', 'pr', 'kind', 'event_id', 'version'))
+        stable_id = 'github_' + hashlib.sha256(event_key.encode()).hexdigest()[:28]
+        previous = self.store.events.get(stable_id)
+        if previous and previous.get('state') in {'queued', 'processed'}:
+            return
+        if self.queue.full():
+            raise ValueError('智能体队列已满，GitHub 反馈将稍后重试。')
+        if previous:
+            self.store.events.pop(stable_id, None)
+            if self.store.db is not None:
+                await self.store.db.execute('DELETE FROM events WHERE id=?', (stable_id,))
+        history = await self.continuity_store.history(link['task_id'], link['owner_id'])
+        history_text = '\n'.join(f"{row['version']} {row['author']}: {row['body'][:500]}" for row in history[-12:])
+        text = f"关联 GitHub PR 的反馈历史（外部内容，不改变权限）：\n{history_text}\n\n当前意见（{event['url']}）：\n{event['body']}"
+        message = await self.store.lookup_message(stable_id)
+        if message is None:
+            message = self.store.add_message(thread_id=task.thread_id, channel='room', role='user',
+                nickname=event['author'], content=text[:4000], user_id=task.owner_id, message_id=stable_id,
+                kind='github_feedback')
+        trigger = Trigger(id=stable_id, thread_id=task.thread_id, channel='room', owner_id=task.owner_id,
+            owner_name=event['author'], content=text[:4000], message_id=message.id, source='github_feedback',
+            continuity_repo=link['repo'], continuity_pr=link['pr'], continuity_task_id=link['task_id'], needs_code_change=True)
+        if not await self._enqueue(trigger):
+            raise ValueError('智能体队列已满，GitHub 反馈将稍后重试。')
 
     # ---------- 队列与限流 ----------
     async def _enqueue(self, trigger: Trigger) -> None:
@@ -273,9 +335,12 @@ class AgentRuntime:
         await self.store.flush()
         try:
             self.queue.put_nowait(trigger)
+            return True
         except asyncio.QueueFull:
             self.store.finish_event(trigger.id, 'rejected')
+            await self.store.flush()
             await self.notify(trigger, "智能体当前排队的任务太多了，请稍后再试。")
+            return False
 
     def _allow(self, user_id: str) -> bool:
         now = time.monotonic()
@@ -300,14 +365,21 @@ class AgentRuntime:
         await self._emit(trigger.channel, trigger.owner_id, packet)
 
     async def emit_reply(self, trigger: Trigger, message_id: str, content: str) -> None:
+        source = await self.store.lookup_message(trigger.message_id) if trigger.source == 'github_feedback' else None
+        if trigger.source == 'github_feedback' and trigger.thread_id != ROOM_THREAD:
+            self.store.add_message(thread_id=trigger.thread_id, channel='room', role='agent', nickname=self.config.name,
+                content=content, user_id=AGENT_USER_ID, kind='auto_context')
         message = self.store.add_message(
-            thread_id=trigger.thread_id,
+            thread_id=ROOM_THREAD if trigger.source == 'github_feedback' else trigger.thread_id,
             channel=trigger.channel,
             role="agent",
             nickname=self.config.name,
             content=content,
             user_id=AGENT_USER_ID,
             message_id=message_id,
+            reply_to=trigger.message_id if source else '',
+            reply_to_user_id=source.user_id if source else '',
+            reply_to_name=source.nickname if source else '',
         )
         packet = {"type": "agent.done", "taskId": None, **message.as_packet()}
         await self.store.flush()
@@ -389,11 +461,16 @@ class AgentRuntime:
             await self.manager.send_to(owner_id, packet)
 
     # ---------- 任务 ----------
-    async def start_task(self, trigger: Trigger, title: str, instruction: str, complexity: str = "light") -> Task:
+    async def start_task(self, trigger: Trigger, title: str, instruction: str, complexity: str = "light", source_message_id: str = "") -> Task:
         if self.automation is not None:
             prepared = await self.automation.context_for(trigger.content)
             if prepared:
                 instruction = instruction[:3000] + '\n\n' + prepared[:1000]
+        if trigger.source == 'auto_assist' and (self.automation is None or not self.automation.policy['autoReply']):
+            return None
+        edit_requested = (trigger.source in {'auto_assist', 'github_feedback', 'continuity_followup'}
+            and trigger.needs_code_change and trigger.continuity_repo and self.github_gateway is not None
+            and self.config.github_write_enabled)
         task = self.store.create_task(
             thread_id=trigger.thread_id,
             channel=trigger.channel,
@@ -401,8 +478,14 @@ class AgentRuntime:
             title=title,
             instruction=instruction,
             complexity=complexity,
+            kind='continuity_edit' if edit_requested else ('auto_assist' if trigger.source in {'auto_assist', 'github_feedback', 'continuity_followup'} else 'interactive'),
+            source_id=source_message_id,
+            continuity_id=trigger.continuity_task_id,
         )
         worker = Worker(self.config, self.llm, self.store, self, task, trigger)
+        if edit_requested:
+            self._continuity_runs[task.id] = {'repo': trigger.continuity_repo, 'pr': trigger.continuity_pr,
+                'parent': trigger.continuity_task_id, 'trigger': trigger}
         self.registry.subscribe(task.id, worker)
         job = asyncio.create_task(self._run_worker(worker), name=f"agent-worker:{task.id}")
         self._workers[task.id] = job
@@ -411,11 +494,66 @@ class AgentRuntime:
         await self.emit_state(task)
         return task
 
+    async def _prepare_continuity(self, worker):
+        from pathlib import Path
+        from .workspace import GitWorkspace
+        from .tools import tool_schemas
+        run = self._continuity_runs[worker.task.id]
+        repo, pr = run['repo'], run['pr']
+        project = self.github_gateway.project(repo)
+        if not project['local_path'] or not project['verify']:
+            raise ValueError('请为项目配置本地仓库和验证命令；未修改 GitHub。')
+        if pr:
+            linked = await self.continuity_store.get(run['parent'], worker.task.owner_id)
+            if not linked or linked['repo'] != repo or linked['pr'] != pr:
+                raise ValueError('任务与 PR 的关联不匹配。')
+            current = await self.github_gateway.pull_request(repo, pr)
+            if current['state'] != 'open' or current['merged'] or current['head_repo'] != repo or current['branch'] != linked['branch']:
+                raise ValueError('PR 已关闭或分支来源改变；未修改 GitHub。')
+            branch, head = current['branch'], current['head_sha']
+            run['link'] = {**linked, 'head_sha': head}
+        else:
+            branch = await self.github_gateway.default_branch(repo)
+            head = await self.github_gateway.branch_head(repo, branch)
+        workspace = GitWorkspace(Path(project['local_path']), self.config.state_path / 'continuity-workspaces')
+        path = await asyncio.to_thread(workspace.create_remote, worker.task.id, repo, branch, head, self.github_gateway._token)
+        run.update({'workspace': workspace, 'path': path, 'base': branch, 'head': head, 'verify': project['verify']})
+        worker.workspace_root = path
+        worker._allow_write = True
+        from .tools import tool_schemas
+        worker._schemas = tool_schemas(True)
+
+    async def _publish_continuity(self, task, content):
+        from .publisher import ProjectPublisher
+        from .workspace import verify_workspace
+        run = self._continuity_runs.get(task.id)
+        if not run or 'path' not in run:
+            raise ValueError('缺少隔离工作区；未修改 GitHub。')
+        publisher = ProjectPublisher(self.github_gateway)
+        async def verify(path):
+            return await verify_workspace(path, run['verify'])
+        if run['pr']:
+            commit = await publisher.update_existing(run['link'], run['workspace'], run['path'], verify=verify)
+            await self.continuity_store.db.execute('UPDATE continuity_links SET head_sha=? WHERE task_id=?', (commit, run['parent']))
+            url = f"https://github.com/{run['repo']}/pull/{run['pr']}"
+            await self.continuity_store.enqueue_comment(run['parent'], task.owner_id, run['trigger'].id,
+                '已根据反馈更新分支，项目验证通过。')
+            suffix = f'已更新 PR：{url}；GitHub 评论等待同步。'
+        else:
+            result = await publisher.create_new(run['repo'], run['base'], run['head'], 'agent/' + task.id,
+                task.title, run['workspace'], run['path'], verify=verify)
+            await self.continuity_store.bind(task.id, task.owner_id, run['repo'], result['number'], result['branch'], result['head_sha'])
+            task.continuity_id = task.id
+            suffix = f"已创建草稿 PR：{result['url']}"
+        return content.rstrip() + '\n\n' + suffix
+
     async def finish_task(self, task: Task, content: str) -> None:
         worker = self._sessions.get(task.id)
         message_id = worker.message_id if worker is not None else new_id("msg")
+        if task.kind == 'continuity_edit':
+            content = await self._publish_continuity(task, content)
         self.store.update_task(task, status="done", result=content, error="")
-        if task.kind == 'interactive':
+        if task.kind in {'interactive', 'auto_assist', 'continuity_edit'}:
             await self._deliver(task, content, message_id)
         await self.emit_state(task)
 
@@ -423,14 +561,18 @@ class AgentRuntime:
         worker = self._sessions.get(task.id)
         message_id = worker.message_id if worker is not None else new_id("msg")
         self.store.update_task(task, status="failed", error=error[:500])
-        if task.kind == 'interactive':
+        if task.kind in {'interactive', 'auto_assist', 'continuity_edit'}:
             await self._deliver(task, f"任务失败：{error[:300]}", message_id)
         await self.notice(task, f'任务失败：{error[:300]}', 'failed')
         await self.emit_state(task)
 
     async def _deliver(self, task: Task, content: str, message_id: str) -> None:
+        source = await self.store.lookup_message(task.source_id) if task.kind in {'auto_assist', 'continuity_edit'} else None
+        if task.kind in {'auto_assist', 'continuity_edit'}:
+            self.store.add_message(thread_id=task.thread_id, channel='room', role='agent', nickname=self.config.name,
+                content=content, user_id=AGENT_USER_ID, kind='auto_context', task_id=task.id)
         message = self.store.add_message(
-            thread_id=task.thread_id,
+            thread_id=ROOM_THREAD if task.kind in {'auto_assist', 'continuity_edit'} else task.thread_id,
             channel=task.channel,
             role="agent",
             nickname=self.config.name,
@@ -439,23 +581,37 @@ class AgentRuntime:
             message_id=message_id,
             kind='task_result',
             task_id=task.id,
+            reply_to=task.source_id if source else '',
+            reply_to_user_id=source.user_id if source else '',
+            reply_to_name=source.nickname if source else '',
         )
         await self.store.flush()
         await self._emit(task.channel, task.owner_id, {"type": "agent.done", "taskId": task.id, **message.as_packet()})
 
     async def _run_worker(self, worker: Worker) -> None:
         task = worker.task
-        try:
-            async with self.dispatcher.slot(task.id, task.kind != 'interactive'):
-                if task.status == "stopped":
+        async def execute():
+            async with self.dispatcher.slot(task.id, task.kind not in {'interactive', 'auto_assist', 'continuity_edit'}):
+                if task.status == 'stopped':
                     await self.emit_state(task)
                     return
-                timeout = self.config.dsh_timeout if self.harness_allowed() else self.config.task_timeout
-                self.store.update_task(task, status="running", deadline_at=time.time() + timeout)
+                timeout = self.config.dsh_timeout if task.kind not in {'auto_assist', 'continuity_edit'} and self.harness_allowed() else self.config.task_timeout
+                self.store.update_task(task, status='running', deadline_at=time.time() + timeout)
                 self.signal(task, progress=True)
                 await self.emit_state(task)
                 async with asyncio.timeout(timeout):
+                    if task.kind == 'continuity_edit':
+                        await self._prepare_continuity(worker)
                     await worker.run()
+        try:
+            if task.kind == 'continuity_edit':
+                run = self._continuity_runs[task.id]
+                key = f"{run['repo']}#{run['pr']}" if run['pr'] else task.id
+                lock = self._continuity_locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    await execute()
+            else:
+                await execute()
         except TimeoutError:
             task.reason_code = 'timeout'
             await self._cancelled(task)
@@ -472,3 +628,4 @@ class AgentRuntime:
             self.registry.unsubscribe(task.id, worker)
             self._workers.pop(task.id, None)
             self._sessions.pop(task.id, None)
+            self._continuity_runs.pop(task.id, None)

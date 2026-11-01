@@ -37,6 +37,9 @@ class AgentStore:
         created_at: str | None = None,
         kind: str = 'chat',
         task_id: str = '',
+        reply_to: str = '',
+        reply_to_user_id: str = '',
+        reply_to_name: str = '',
     ) -> Message:
         message = Message(
             id=message_id or new_id("msg"),
@@ -49,6 +52,7 @@ class AgentStore:
             user_id=user_id,
             kind=kind,
             task_id=task_id,
+            reply_to=reply_to, reply_to_user_id=reply_to_user_id, reply_to_name=reply_to_name,
         )
         if len(self._messages) == self._messages.maxlen:
             self._by_id.pop(self._messages[0].id, None)
@@ -80,6 +84,7 @@ class AgentStore:
         complexity: str = "light",
         kind: str = 'interactive',
         source_id: str = '',
+        continuity_id: str = '',
     ) -> Task:
         task = Task(
             id=new_id("task"),
@@ -91,6 +96,7 @@ class AgentStore:
             complexity="heavy" if complexity == "heavy" else "light",
             kind=kind,
             source_id=source_id,
+            continuity_id=continuity_id,
         )
         self.tasks[task.id] = task
         self._save_task(task)
@@ -140,7 +146,7 @@ class AgentStore:
         rows = await self.db.all('SELECT payload FROM messages ORDER BY created_at DESC LIMIT 2000')
         for row in reversed(rows):
             data = json.loads(row['payload'])
-            self.add_message(**{k: data[k] for k in ('thread_id','channel','role','nickname','content','user_id','created_at','kind','task_id') if k in data}, message_id=data['id'])
+            self.add_message(**{k: data[k] for k in ('thread_id','channel','role','nickname','content','user_id','created_at','kind','task_id','reply_to','reply_to_user_id','reply_to_name') if k in data}, message_id=data['id'])
         self._pending.clear()
         keys = {field.name for field in fields(Task)}
         for row in await self.db.all('SELECT payload FROM tasks'):
